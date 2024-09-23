@@ -39,7 +39,7 @@ from ...modeling_outputs import (
 )
 from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from ...modeling_utils import PreTrainedModel
-from ...pytorch_utils import ALL_LAYERNORM_LAYERS
+from ...pytorch_utils import ALL_LAYERNORM_LAYERS, find_pruneable_heads_and_indices, prune_linear_layer
 from ...utils import (
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
@@ -658,6 +658,27 @@ class CohereDecoderLayer(nn.Module):
 
         self.mlp = CohereMLP(config)
         self.input_layernorm = CohereLayerNorm(hidden_size=(config.hidden_size), eps=config.layer_norm_eps)
+        self.pruned_heads = set()
+
+    def prune_heads(self, heads):
+        if len(heads) == 0:
+            return
+        heads, index = find_pruneable_heads_and_indices(
+            heads, self.self_attn.num_heads, self.self_attn.head_dim, self.pruned_heads
+        )
+
+        # Prune linear layers
+        self.self_attn.q_proj = prune_linear_layer(self.self_attn.q_proj, index)
+        self.self_attn.k_proj = prune_linear_layer(self.self_attn.k_proj, index)
+        self.self_attn.v_proj = prune_linear_layer(self.self_attn.v_proj, index)
+        self.self_attn.o_proj = prune_linear_layer(self.self_attn.o_proj, index, dim=1)
+
+        # Update hyper params and store pruned heads
+        self.self_attn.num_heads = self.self_attn.num_heads - len(heads)
+        self.self_attn.hidden_size = self.self_attn.head_dim * self.self_attn.num_heads
+        self.self_attn.num_key_value_groups = self.self_attn.num_heads // self.self_attn.num_key_value_heads
+
+        self.pruned_heads = self.pruned_heads.union(heads)
 
     def forward(
         self,
@@ -868,6 +889,14 @@ class CohereModel(CoherePreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+    def _prune_heads(self, heads_to_prune):
+        """
+        Prunes heads of the model. heads_to_prune: dict of {layer_num: list of heads to prune in this layer} See base
+        class PreTrainedModel
+        """
+        for layer, heads in heads_to_prune.items():
+            self.layers[layer].prune_heads(heads)
 
     def get_input_embeddings(self):
         return self.embed_tokens
